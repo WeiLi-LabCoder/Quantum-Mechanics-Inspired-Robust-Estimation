@@ -1,0 +1,175 @@
+clear; clc;
+
+% === Parameter setting ===
+N_r = 4; N_t = 4; L = 4;
+SNR_Range = -20:5:10;
+FrameAll = 1000;         
+MC_train = 500;          % frames for training 
+var_channel = 1;
+hbar = 1; mass = 1;
+const_Hamil = hbar^2 / (2 * mass); 
+
+% === Initialization ===
+err_no_denoise = zeros(1, length(SNR_Range));
+err_optimal_tau = zeros(1, length(SNR_Range));
+err_trained_tau = zeros(1, length(SNR_Range));
+beta_SNR = zeros(2, length(SNR_Range));
+
+% === Fixed channel for fair comparison ===
+rng(42);
+% correlated channel 
+% rho = 0.99; 
+% H_vec = mvnrnd(zeros(N_r*N_t, 1), (1 - rho) * eye(N_r*N_t) + rho * ones(N_r*N_t));   
+% Channel_H = reshape(H_vec, N_r, N_t); 
+Channel_H = sqrt(var_channel) * randn(N_r, N_t);   % i.i.d. channel
+
+Hamil_P_base = Hamiltonian_Original(N_r, L, const_Hamil);
+rng('shuffle');
+
+% === Offline training: beta ===
+for snr_idx = 1:length(SNR_Range)
+    SNR = SNR_Range(snr_idx);
+    var_noise = 10^(-0.1 * SNR);
+
+    U_P_list = cell(MC_train, 1);
+    alpha_train_list = cell(MC_train, 1);
+    alpha_true_list = cell(MC_train, 1);
+
+    for frame = 1:MC_train
+        Symbol_X = randi([0,1], N_t, L);
+
+        % noise = sqrt(var_noise) * randn(N_r, L) ; % Gaussian noise 
+        % noise = poissrnd(var_noise, N_r, L) - var_noise; % Poission noise
+        % noise = sqrt(var_noise) * randn(N_r, L) + poissrnd(var_noise, N_r, L) - var_noise; % mixed Gaussian and Poission noise 
+        
+        % alpha-stable noise
+        alpha = 1;
+        P_sig = 1; 
+        gamma = (P_sig ./ (10.^(SNR_test / 10))).^(1 / alpha);
+        noise = symmetric_alpha_stable(alpha, gamma, N_r, L);
+
+
+        Chan_Symbol = Channel_H * Symbol_X;
+        Rec_vec_y = Chan_Symbol(:) + noise(:);
+
+        Hamil_P = Hamil_P_base + diag(Rec_vec_y);
+        [U_P, ~, ~] = svd(Hamil_P);
+        alpha = U_P \ Rec_vec_y;
+        alpha_true = U_P \ Chan_Symbol(:);
+
+        U_P_list{frame} = U_P;
+        alpha_train_list{frame} = alpha;
+        alpha_true_list{frame} = alpha_true;
+    end
+
+    % Optimize beta (trained beta used in evaluation)
+    beta_init = [1; 0.01];
+    options = optimset('Display','off','MaxIter',300);
+    beta_opt = fminsearch(@(b) ...
+        sum(arrayfun(@(i) ...
+            norm(U_P_list{i} * (alpha_train_list{i} .* ...
+            (1./(1 + exp(b(1)*(abs(alpha_train_list{i}) - b(2))))) ) ...
+            - U_P_list{i} * alpha_true_list{i})^2, ...
+            1:MC_train)), ...
+        beta_init, options);
+
+    beta_SNR(:, snr_idx) = beta_opt;
+end
+
+% === Test ===
+for snr_idx = 1:length(SNR_Range)
+    SNR = SNR_Range(snr_idx);
+    var_noise = 10^(-0.1 * SNR);
+    beta_fixed = beta_SNR(:, snr_idx);
+
+    % initialization 
+    valid_count_optimal = 0;
+    valid_count_trained = 0;
+    valid_count_no = 0;
+
+    for frame = 1:FrameAll
+        % correlated channel 
+        % rho = 0.99; 
+        % H_vec = mvnrnd(zeros(N_r*N_t, 1), (1 - rho) * eye(N_r*N_t) + rho * ones(N_r*N_t));   
+        % Channel_H = reshape(H_vec, N_r, N_t); 
+        Channel_H = sqrt(var_channel) * randn(N_r, N_t);   % i.i.d. channel
+
+        Symbol_X = randi([0,1], N_t, L);
+        Chan_Symbol = Channel_H * Symbol_X;
+        
+        noise = sqrt(var_noise) * randn(N_r, L) ; % Gaussian noise 
+        % noise = poissrnd(var_noise, N_r, L) - var_noise; % Poisson noise
+        % noise = sqrt(var_noise) * randn(N_r, L) + poissrnd(var_noise, N_r, L) - var_noise; % mixed Gaussian and Poission noise 
+
+        Rec_Y = Chan_Symbol + noise;
+        Rec_vec_y = Rec_Y(:);
+
+        % -- No Denoising --
+        err_temp = norm(Rec_vec_y - Chan_Symbol(:))^2 / norm(Chan_Symbol(:))^2;
+        if isfinite(err_temp) 
+            err_no_denoise(snr_idx) = err_no_denoise(snr_idx) + err_temp;
+            valid_count_no = valid_count_no + 1;
+        end
+
+        % -- Quantum Denoising (Optimal \tau) --
+        Hamil_P = Hamil_P_base + diag(Rec_vec_y);
+        [U_P, ~, ~] = svd(Hamil_P);
+        alpha_train = U_P \ Rec_vec_y;
+        alpha_true = U_P \ Chan_Symbol(:);
+
+        % Optimize beta for current frame
+        loss_fun = @(b) norm(U_P * (alpha_train .* (1 ./ (1 + exp(b(1)*(abs(alpha_train) - b(2)))))) ...
+                               - U_P * alpha_true)^2;
+        beta_opt_frame = fminsearch(loss_fun, [1; 0.01], optimset('Display','off','MaxIter',300));
+
+        tau_opt = 1 ./ (1 + exp(beta_opt_frame(1)*(abs(alpha_train) - beta_opt_frame(2))));
+        Rec_Y_opt = U_P * (alpha_train .* tau_opt);
+        err_optimal = norm(Rec_Y_opt - Chan_Symbol(:))^2 / norm(Chan_Symbol(:))^2; 
+        if isfinite(err_optimal) 
+            err_optimal_tau(snr_idx) = err_optimal_tau(snr_idx) + err_optimal;
+            valid_count_optimal = valid_count_optimal + 1;
+        end
+
+        % -- Quantum Denoising (Trained \tau) --
+        tau_trained = 1 ./ (1 + exp(beta_fixed(1)*(abs(alpha_train) - beta_fixed(2))));
+        Rec_Y_trained = U_P * (alpha_train .* tau_trained);
+        err_trained = norm(Rec_Y_trained - Chan_Symbol(:))^2 / norm(Chan_Symbol(:))^2;
+        if isfinite(err_trained) 
+            err_trained_tau(snr_idx) = err_trained_tau(snr_idx) + err_trained;
+            valid_count_trained = valid_count_trained + 1;
+        end  
+    end
+
+    % Normalize error by valid counts
+    if valid_count_no > 0
+        err_no_denoise(snr_idx) = err_no_denoise(snr_idx) / valid_count_no;
+    else
+        err_no_denoise(snr_idx) = NaN;
+    end
+
+    if valid_count_optimal > 0
+        err_optimal_tau(snr_idx) = err_optimal_tau(snr_idx) / valid_count_optimal;
+    else
+        err_optimal_tau(snr_idx) = NaN;
+    end
+
+    if valid_count_trained > 0
+        err_trained_tau(snr_idx) = err_trained_tau(snr_idx) / valid_count_trained;
+    else
+        err_trained_tau(snr_idx) = NaN;
+    end
+end
+
+figure
+semilogy(SNR_Range, err_no_denoise, 'xb-', 'LineWidth', 1.5); hold on
+semilogy(SNR_Range, err_optimal_tau, 'or-', 'LineWidth', 1.5);
+semilogy(SNR_Range, err_trained_tau, 'dg--', 'LineWidth', 1.5);
+xlabel('SNR (dB)', 'Interpreter', 'latex')
+ylabel('Estimation NMSE', 'Interpreter', 'latex')
+legend({'No denoising', ...
+        'Quantum denoising (optimal $\tau$)', ...
+        'Quantum denoising (trained $\tau$)'}, ...
+        'Interpreter','latex','Location','southwest')
+grid on
+title(sprintf('Quantum denoising: optimal vs. trained $\\tau$ ($N_r = %d$, $N_t = %d$, $L = %d$)', ...
+    N_r, N_t, L), 'Interpreter', 'latex');
